@@ -1,3 +1,9 @@
+import torch
+import torch.nn.functional as F
+import math
+import numpy as np
+from .samplers import expand_dims
+
 class RBFSolver:
     def __init__(
             self,
@@ -99,6 +105,7 @@ class RBFSolver:
         elif width_type == 3:
             avg_h_sq = torch.mean(torch.diff(lambdas) ** 2)
             return 1 / avg_h_sq
+    
         return 0
     
     def get_kernel_matrix(self, lambdas, width):
@@ -108,31 +115,60 @@ class RBFSolver:
         K = torch.exp(-width**2 * (lambdas - lambdas.T) ** 2)
         return K
 
-    def get_integral_vector(self, lambda_s, lambda_t, lambdas, width):
-        if width == 0:
-            return (torch.exp(-lambda_s) - torch.exp(-lambda_t)) * torch.ones_like(lambdas)
+#     def get_integral_vector(self, lambda_s, lambda_t, lambdas, width):
+#         if width == 0:
+#             return (torch.exp(-lambda_s) - torch.exp(-lambda_t)) * torch.ones_like(lambdas)
         
-        factor = torch.sqrt(torch.tensor(math.pi)) / (2*width)
-        exponent = torch.exp(-lambdas + 1.0/(4.0*width**2))
-        upper = torch.erf(width*(lambda_t - lambdas) + 1.0/(2.0*width))
-        lower = torch.erf(width*(lambda_s - lambdas) + 1.0/(2.0*width))
+#         factor = torch.sqrt(torch.tensor(math.pi)) / (2*width)
+#         exponent = torch.exp(-lambdas + 1.0/(4.0*width**2))
+#         upper = torch.erf(width*(lambda_t - lambdas) + 1.0/(2.0*width))
+#         lower = torch.erf(width*(lambda_s - lambdas) + 1.0/(2.0*width))
+#         return factor * exponent * (upper - lower)
+    
+    def get_integral_vector(self, lambda_s, lambda_t, lambdas, width):
+        import numpy as np
+        from scipy.special import erf
+        import math
+
+        """
+        Computes the integral vector equivalent to the PyTorch version,
+        but using NumPy / SciPy operations.
+        """
+        # Handle the zero-width case.
+        if width == 0:
+            if self.predict_x0:
+                return (np.exp(lambda_s) - np.exp(lambda_t)) * np.ones_like(lambdas)
+            else:    
+                return (np.exp(-lambda_s) - np.exp(-lambda_t)) * np.ones_like(lambdas)
+
+        # Compute factor, exponent, and (upper - lower) via the error function.
+        factor = np.sqrt(math.pi) / (2 * width)
+        
+        if self.predict_x0:
+            exponent = np.exp(lambdas + 1.0 / (4.0 * width**2))
+            upper = erf(width * (lambda_t - lambdas) - 1.0 / (2.0 * width))
+            lower = erf(width * (lambda_s - lambdas) - 1.0 / (2.0 * width))
+        else:
+            exponent = np.exp(-lambdas + 1.0 / (4.0 * width**2))
+            upper = erf(width * (lambda_t - lambdas) + 1.0 / (2.0 * width))
+            lower = erf(width * (lambda_s - lambdas) + 1.0 / (2.0 * width))
+            
         return factor * exponent * (upper - lower)
 
-    def get_noise_coefficients(self, lambda_s, lambda_t, lambdas, width):
+    def get_coefficients(self, lambda_s, lambda_t, lambdas, width):
         # (p,)
         integral = self.get_integral_vector(lambda_s, lambda_t, lambdas, width)
         # (p, p)
         kernel = self.get_kernel_matrix(lambdas, width)
-        kernel_inv = torch.linalg.inv(kernel)
         # (p,)
-        coefficients = (integral[None, :] @ kernel_inv)[0]
+        coefficients = (integral[None, :] @ torch.linalg.inv(kernel))[0]
         return coefficients
 
-    def get_next_sample_for_noise_prediction(self, sample, i, noise_list, signal_rates, lambdas, p, width, width_type, corrector=False):
+    def get_next_sample(self, sample, i, hist, signal_rates, noise_rates, lambdas, p, width, width_type, corrector=False):
         '''
         sample : (b, c, h, w), tensor
         i : current sampling step, scalar
-        noise_list : [ε_0, ε_1, ...], tensor list
+        hist : [ε_0, ε_1, ...] or [x_0, x_1, ...], tensor list
         signal_rates : [α_0, α_1, ...], tensor list
         lambdas : [λ_0, λ_1, ...], scalar list
         width : width of RBF kernel
@@ -147,15 +183,21 @@ class RBFSolver:
 
         # for predictor, (c_i, c_i-1, ..., c_i-p+1), shape : (p,),
         # for corrector, (c_i+1, c_i, ..., c_i-p+1), shape : (p+1,)
-        noise_coeffs = self.get_noise_coefficients(lambdas[i], lambdas[i+1], lambda_array, width)
-        print(noise_coeffs)
-    
+        coeffs = self.get_coefficients(lambdas[i], lambdas[i+1], lambda_array, width)
+#         if self.predict_x0:
+#             print('coeffs sum :', torch.sum(coeffs), 'true sum :', torch.exp(lambdas[i+1]) - torch.exp(lambdas[i]))
+#         else:
+#             print('coeffs sum :', torch.sum(coeffs), 'true sum :', -torch.exp(-lambdas[i+1]) - (-torch.exp(-lambdas[i])))
+        
         # for predictor, (ε_i, ε_i-1, ..., ε_i-p+1), shape : (p,),
         # for corrector, (ε_i+1, λ_i, ..., ε_i-p+1), shape : (p+1,)
-        noise_array = noise_list[i-p+1:i+(2 if corrector else 1)][::-1]
+        datas = hist[i-p+1:i+(2 if corrector else 1)][::-1]
         
-        noise_sum = sum([noise_coeff * noise for noise_coeff, noise in zip(noise_coeffs, noise_array)])
-        next_sample = signal_rates[i+1]/signal_rates[i]*sample - signal_rates[i+1]*noise_sum
+        data_sum = sum([coeff * data for coeff, data in zip(coeffs, datas)])
+        if self.predict_x0:
+            next_sample = noise_rates[i+1]/noise_rates[i]*sample + noise_rates[i+1]*data_sum
+        else:
+            next_sample = signal_rates[i+1]/signal_rates[i]*sample - signal_rates[i+1]*data_sum
         return next_sample
     
     def sample(self, x, steps, skip_type='logSNR', order=3, width=1, width_type=1):
@@ -190,8 +232,8 @@ class RBFSolver:
             signal_rates = torch.Tensor([self.noise_schedule.marginal_alpha(t) for t in timesteps])
             noise_rates = torch.Tensor([self.noise_schedule.marginal_std(t) for t in timesteps])
             
-            noise_list = [None for _ in range(steps)]
-            noise_list[0] = self.model_fn(x, timesteps[0])   # model(x,t) 평가값을 저장
+            hist = [None for _ in range(steps)]
+            hist[0] = self.model_fn(x, timesteps[0])   # model(x,t) 평가값을 저장
             
             for i in range(0, steps):
                 if lower_order_final:
@@ -200,19 +242,19 @@ class RBFSolver:
                     p = min(i+1, order)
                     
                 # ===predictor===
-                x_pred = self.get_next_sample_for_noise_prediction(x, i, noise_list, signal_rates, lambdas,
-                                                              p=p, width=width, width_type=width_type, corrector=False)
+                x_pred = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
+                                              p=p, width=width, width_type=width_type, corrector=False)
                 
                 if i == steps - 1:
                     x = x_pred
                     break
                 
                 # predictor로 구한 x_pred를 이용해서 model_fn 평가
-                noise_list[i+1] = self.model_fn(x_pred, timesteps[i+1])
+                hist[i+1] = self.model_fn(x_pred, timesteps[i+1])
                 
-#                 # ===corrector===
-                x_corr = self.get_next_sample_for_noise_prediction(x, i, noise_list, signal_rates, lambdas,
-                                                              p=p, width=width, width_type=width_type, corrector=True)
+                # ===corrector===
+                x_corr = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
+                                              p=p, width=width, width_type=width_type, corrector=True)
                 x = x_corr
         # 최종적으로 x를 반환
         return x
