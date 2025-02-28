@@ -90,24 +90,6 @@ class RBFSolver:
         """
         return self.data_prediction_fn(x, s)
     
-    def get_width(self, lambdas, width_type=1):
-        if len(lambdas) < 2:
-            return 0
-
-        if width_type == 1:
-            h_i = abs(lambdas[0] - lambdas[1])
-            return 1 / h_i**2
-
-        elif width_type == 2:
-            avg_h = abs(lambdas[0] - lambdas[-1]) / (len(lambdas)-1)
-            return 1 / avg_h**2
-
-        elif width_type == 3:
-            avg_h_sq = torch.mean(torch.diff(lambdas) ** 2)
-            return 1 / avg_h_sq
-    
-        return 0
-    
     def get_kernel_matrix(self, lambdas, width):
         # (p, 1)
         lambdas = lambdas[:, None]
@@ -164,7 +146,7 @@ class RBFSolver:
         coefficients = (integral[None, :] @ torch.linalg.inv(kernel))[0]
         return coefficients
 
-    def get_next_sample(self, sample, i, hist, signal_rates, noise_rates, lambdas, p, width, width_type, corrector=False):
+    def get_next_sample(self, sample, i, hist, signal_rates, noise_rates, lambdas, p, width, corrector=False):
         '''
         sample : (b, c, h, w), tensor
         i : current sampling step, scalar
@@ -178,8 +160,6 @@ class RBFSolver:
         # for predictor, (λ_i, λ_i-1, ..., λ_i-p+1), shape : (p,),
         # for corrector, (λ_i+1, λ_i, ..., λ_i-p+1), shape : (p+1,)
         lambda_array = torch.flip(lambdas[i-p+1:i+(2 if corrector else 1)], dims=[0])
-        if width_type > 0:
-            width = self.get_width(lambda_array, width_type)
 
         # for predictor, (c_i, c_i-1, ..., c_i-p+1), shape : (p,),
         # for corrector, (c_i+1, c_i, ..., c_i-p+1), shape : (p+1,)
@@ -200,17 +180,8 @@ class RBFSolver:
             next_sample = signal_rates[i+1]/signal_rates[i]*sample - signal_rates[i+1]*data_sum
         return next_sample
     
-    def sample(self, x, steps, skip_type='logSNR', order=3, width=1, width_type=1):
+    def sample(self, x, steps, skip_type='logSNR', order=3, gamma=3):
         
-        """
-        논문에서 제안된 Stochastic Adams Solver 중 'few_steps' 설정으로 샘플링하는 메서드.
-        PC-mode(Predictor-Corrector)에 따라 스텝마다 predictor, corrector 단계를 수행.
-        predictor에는 adams-bashforth, corrector에는 adams-moulton 방식을 사용.
-        ...
-        """
-
-        # 우선 몇 가지 내부 플래그를 설정한다.
-        skip_final_step = True    # 마지막 스텝에서 corrector를 건너뛸지 여부. (few_steps 모드에서 true)
         lower_order_final = True  # 전체 스텝이 매우 작을 때 마지막 스텝에서 차수를 낮춰서 안정성 확보할지.
 
         # 샘플링할 시간 범위 설정 (t_0, t_T)
@@ -231,6 +202,7 @@ class RBFSolver:
             lambdas = torch.Tensor([self.noise_schedule.marginal_lambda(t) for t in timesteps])
             signal_rates = torch.Tensor([self.noise_schedule.marginal_alpha(t) for t in timesteps])
             noise_rates = torch.Tensor([self.noise_schedule.marginal_std(t) for t in timesteps])
+            width = steps / (gamma * abs(lambdas[-1] - lambdas[0]))
             
             hist = [None for _ in range(steps)]
             hist[0] = self.model_fn(x, timesteps[0])   # model(x,t) 평가값을 저장
@@ -243,7 +215,7 @@ class RBFSolver:
                     
                 # ===predictor===
                 x_pred = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
-                                              p=p, width=width, width_type=width_type, corrector=False)
+                                              p=p, width=width, corrector=False)
                 
                 if i == steps - 1:
                     x = x_pred
@@ -254,7 +226,7 @@ class RBFSolver:
                 
                 # ===corrector===
                 x_corr = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
-                                              p=p, width=width, width_type=width_type, corrector=True)
+                                              p=p, width=width, corrector=True)
                 x = x_corr
         # 최종적으로 x를 반환
         return x
