@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
+from scipy.integrate import quad
 from .sampler import expand_dims
 
 class RBFSolverCPD:
@@ -99,8 +100,7 @@ class RBFSolverCPD:
         return K
 
     def get_integral_vector(self, lambda_s, lambda_t, lambdas, beta):
-        from scipy.integrate import quad
-
+        
         # Handle the zero-beta case.
         if beta == 0:
             if self.predict_x0:
@@ -166,8 +166,8 @@ class RBFSolverCPD:
             next_sample = signal_rates[i+1]/signal_rates[i]*sample - signal_rates[i+1]*data_sum
         return next_sample
     
-    def get_loss_by_target_matching(self, i, steps, target, hist, gamma, lambdas, p, corrector=False):
-        beta = steps / (np.exp(gamma) * abs(lambdas[-1] - lambdas[0]))
+    def get_loss_by_target_matching(self, i, steps, target, hist, log_gamma, lambdas, p, corrector=False):
+        beta = steps / (np.exp(log_gamma) * abs(lambdas[-1] - lambdas[0]))
         lambda_array = torch.flip(lambdas[i-p+1:i+(2 if corrector else 1)], dims=[0])
         coeffs = self.get_coefficients(lambdas[i], lambdas[i+1], lambda_array, beta)
         
@@ -183,13 +183,13 @@ class RBFSolverCPD:
         loss = F.mse_loss(target, pred)
         return loss
 
-    def sample_by_target_matching(self, x, target, steps, skip_type='logSNR', order=3, gamma_max=5.0, gamma_num=10):
+    def sample_by_target_matching(self, x, target, steps, skip_type='logSNR', order=3, log_gamma_max=5.0, log_gamma_num=10):
         # x : start noise to sample
         # target : target image to sample
-        # gamma_max : absolute value of log gamma to search, gamma가 log gamma로 사용됨에 주의!!!
-        # gamma_num : # of gamma in [-log(gamma), log(gamma)] to search
+        # log_gamma_max : absolute value of log gamma to search
+        # log_gamma_num : # of log gamma in [-log_gamma, log_gamma] to search
 
-        gamma_min = -gamma_max
+        log_gamma_min = -log_gamma_max
         lower_order_final = True  # 전체 스텝이 매우 작을 때 마지막 스텝에서 차수를 낮춰서 안정성 확보할지.
 
         # 샘플링할 시간 범위 설정 (t_0, t_T)
@@ -210,9 +210,9 @@ class RBFSolverCPD:
             lambdas = torch.Tensor([self.noise_schedule.marginal_lambda(t) for t in timesteps])
             signal_rates = torch.Tensor([self.noise_schedule.marginal_alpha(t) for t in timesteps])
             noise_rates = torch.Tensor([self.noise_schedule.marginal_std(t) for t in timesteps])
-            gammas = np.linspace(gamma_min, gamma_max, gamma_num)
-            optimal_gammas_p = []
-            optimal_gammas_c = []
+            log_gammas = np.linspace(log_gamma_min, log_gamma_max, log_gamma_num)
+            optimal_log_gammas_p = []
+            optimal_log_gammas_c = []
 
             hist = [None for _ in range(steps)]
             hist[0] = self.model_fn(x, timesteps[0])   # model(x,t) 평가값을 저장
@@ -225,13 +225,13 @@ class RBFSolverCPD:
                     
                 # ===predictor===
                 pred_losses = []
-                for gamma in gammas:
-                    loss = self.get_loss_by_target_matching(i, steps, target, hist, gamma, lambdas, p, corrector=False)
+                for log_gamma in log_gammas:
+                    loss = self.get_loss_by_target_matching(i, steps, target, hist, log_gamma, lambdas, p, corrector=False)
                     pred_losses.append(loss)
 
-                optimal_gamma = gammas[torch.stack(pred_losses).argmin()]
-                optimal_gammas_p.append(optimal_gamma)
-                beta = steps / (np.exp(optimal_gamma) * abs(lambdas[-1] - lambdas[0]))
+                optimal_log_gamma_p = log_gammas[torch.stack(pred_losses).argmin()]
+                optimal_log_gammas_p.append(optimal_log_gamma_p)
+                beta = steps / (np.exp(optimal_log_gamma_p) * abs(lambdas[-1] - lambdas[0]))
                 x_pred = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
                                               p=p, beta=beta, corrector=False)
                 
@@ -244,33 +244,32 @@ class RBFSolverCPD:
                 
                 # ===corrector===
                 corr_losses = []
-                for gamma in gammas:
-                    loss = self.get_loss_by_target_matching(i, steps, target, hist, gamma, lambdas, p, corrector=True)
+                for log_gamma in log_gammas:
+                    loss = self.get_loss_by_target_matching(i, steps, target, hist, log_gamma, lambdas, p, corrector=True)
                     corr_losses.append(loss)
 
-                optimal_gamma = gammas[torch.stack(corr_losses).argmin()]
-                optimal_gammas_c.append(optimal_gamma)
-                beta = steps / (np.exp(optimal_gamma) * abs(lambdas[-1] - lambdas[0]))
+                optimal_log_gamma_c = log_gammas[torch.stack(corr_losses).argmin()]
+                optimal_log_gammas_c.append(optimal_log_gamma_c)
+                beta = steps / (np.exp(optimal_log_gamma_c) * abs(lambdas[-1] - lambdas[0]))
                 x_corr = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
                                               p=p, beta=beta, corrector=True)
                 x = x_corr
+        
+        # optimal_log_gammas_p, optimal_log_gammas_c를 받아 저장하는 기능 추가 필요!
+        return x, optimal_log_gammas_p, optimal_log_gammas_c    
 
-        return x, optimal_gammas_p, optimal_gammas_c    
-
-    def load_optimal_gamma(self, NFE, order, gamma_max):
+    def load_optimal_log_gammas(self, NFE, order, log_gamma_max):
         load_path = '/data/data/optimal_gamma_target_matching_cpd_lg'
-        load_file = os.path.join(load_path, f'NFE={NFE},p={order},gamma_max={gamma_max}.npy')
-        optimal_gammas = np.load(load_file)
-        return optimal_gammas
+        load_file = os.path.join(load_path, f'NFE={NFE},p={order},log_gamma_max={log_gamma_max}.npy')
+        log_gammas = np.load(load_file)
+        return log_gammas
     
-    def sample(self, x, steps, skip_type='logSNR', order=3, gamma=1.0, gamma_max=None):
-        # gamma : gamma가 log gamma로 사용됨에 주의할 것!!!
-
-        # gamma_max : gamma_max가 지정되면 sample_by_target_matching로 튜닝되어 저장된 .npy를 읽어옴
-        if gamma_max is not None:
-            gammas = self.load_optimal_gamma(steps, order, gamma_max)
+    def sample(self, x, steps, skip_type='logSNR', order=3, log_gamma=1.0, log_gamma_max=None):
+        # log_gamma_max : log_gamma_max가 지정되면 sample_by_target_matching로 튜닝되어 저장된 .npy를 읽어옴
+        if log_gamma_max is not None:
+            log_gammas = self.load_optimal_log_gammas(steps, order, log_gamma_max)
         else:
-            gammas = None
+            log_gammas = None
         
         lower_order_final = True  # 전체 스텝이 매우 작을 때 마지막 스텝에서 차수를 낮춰서 안정성 확보할지.
 
@@ -303,7 +302,7 @@ class RBFSolverCPD:
                     p = min(i+1, order)
 
                 # ===predictor===
-                g = gamma if gammas is None else gammas[0, i]
+                g = log_gamma if log_gammas is None else log_gammas[0, i]
                 beta = steps / (np.exp(g) * abs(lambdas[-1] - lambdas[0]))
                 x_pred = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
                                               p=p, beta=beta, corrector=False)
@@ -316,7 +315,7 @@ class RBFSolverCPD:
                 hist[i+1] = self.model_fn(x_pred, timesteps[i+1])
                 
                 # ===corrector===
-                g = gamma if gammas is None else gammas[1, i]
+                g = log_gamma if log_gammas is None else log_gammas[1, i]
                 beta = steps / (np.exp(g) * abs(lambdas[-1] - lambdas[0]))
                 x_corr = self.get_next_sample(x, i, hist, signal_rates, noise_rates, lambdas,
                                               p=p, beta=beta, corrector=True)
