@@ -352,7 +352,7 @@ class RBFSolverECPMarginal:
                 # ===Evaluation===
                 hist[i] = self.model_fn(x_pred, timesteps[i])
                 
-                d = signal_rates[i+1]*data_target + noise_rates[i+1]*noise_target
+                target = signal_rates[i+1]*data_target + noise_rates[i+1]*noise_target
                 if i > 0: # Grid Search
                     loss_grid = np.full((self.log_scale_num, self.log_scale_num), np.inf)
                     for pindex, log_scale_p in enumerate(log_scales):
